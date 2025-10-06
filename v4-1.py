@@ -274,10 +274,28 @@ class EVTFitter:
         x_4k  = xs[n - 4*k - 1] if n - 4*k - 1 >= 0 else xs[0]
         num = max(1e-12, x_2k - x_4k)
         den = max(1e-12, x_nk - x_2k)
-        xi  = float(np.log(num / den) / np.log(2.0))
-        xi  = float(np.clip(xi, -0.5, 0.75))
-        # Pickands-유형 스케일 근사: beta ≈ (1 - xi) * (x_{n-k} - u) 혹은 표준적 GPD 적합으로 대체
-        beta = float(max(1e-8, (1.0 - xi) * (x_nk)))
+        xi = float(np.log(num / den) / np.log(2.0))
+        # 코사인 유사도 tail은 유계(Weibull) → ξ ≤ 0 강제
+        xi = float(np.clip(xi, -0.9, 0.0))
+        # Pickands-유형 스케일 근사: 항상 양수 유지
+        beta = float(max(1e-6, (1.0 - xi) * max(1e-6, x_nk)))
+        return xi, beta
+
+    def _pwm(self, xs: np.ndarray) -> Tuple[float, float]:
+        n = xs.size
+        if n < 3:
+            return self._pickands(xs)
+        y = np.sort(xs)
+        b0 = float(np.mean(y))
+        i = np.arange(1, n + 1, dtype=np.float64)
+        w = (i - 1.0) / max(1.0, (n - 1.0))
+        b1 = float(np.sum(w * y) / n)
+        t = float((2.0 * b1 - b0) / max(1e-12, b0))
+        if not np.isfinite(t) or t <= 0.0:
+            return self._pickands(xs)
+        xi = 2.0 - 1.0 / max(1e-6, t)
+        xi = float(np.clip(xi, -0.9, 0.0))
+        beta = float(max(1e-6, b0 * (1.0 - xi)))
         return xi, beta
 
     def fit(self, data: np.ndarray) -> Optional[EVTFit]:
@@ -291,19 +309,29 @@ class EVTFitter:
         if excess.size < max(50, int(0.1 * cfg.min_tail)):
             return None
         xs = np.sort(excess)
-        xi, beta = self._pickands(xs)
+        xi, beta = self._pwm(xs)
         return EVTFit(u=u, xi=xi, beta=beta, tail_n=xs.size)
     def quantile(self, fit: EVTFit, q: float) -> float:
         cfg = self.cfg
         q = float(np.clip(q, cfg.q0 + 1e-6, 1.0 - 1e-9))
         q0 = float(np.clip(cfg.q0, 1e-6, 1.0 - 1e-6))
-        xi, beta, u = fit.xi, fit.beta, fit.u
+        xi, beta, u = float(fit.xi), float(max(1e-8, fit.beta)), float(fit.u)
+        finite_cap = float(cfg.clip_high)
+        if xi < -1e-6:
+            # Weibull(ξ<0) → 유한 상단 끝점 (u - beta/xi)
+            xF = u - beta / xi
+            if not np.isfinite(xF) or xF <= u:
+                finite_cap = float(cfg.clip_high)
+            else:
+                finite_cap = min(finite_cap, float(xF) - 1e-6)
         if abs(xi) < 1e-6:
             z = -math.log((1.0 - q) / (1.0 - q0))
             tau = u + beta * z
         else:
             z = ((1.0 - q) / (1.0 - q0)) ** (-xi) - 1.0
             tau = u + (beta/xi) * z
+        if xi < -1e-6 and np.isfinite(finite_cap):
+            tau = min(tau, finite_cap)
         tau = float(np.clip(tau, cfg.clip_low, cfg.clip_high))
         return tau
 
@@ -328,6 +356,8 @@ class AutoCal:
     alpha_t: float = 0.90
 
     def __post_init__(self):
+        self.evt.clip_high = float(min(self.evt.clip_high, self.cos_upper))
+        self.evt.clip_low = float(max(self.evt.clip_low, self.cos_lower))
         self.tail_buf: Deque[float] = deque(maxlen=int(self.buffer_maxlen))
         self.ph_alpha = PageHinkley(delta=0.0, lam=float(self.ph_lambda), alpha=1.0,
                                     var_guard=True, reset_on_change=True)
@@ -369,8 +399,10 @@ class AutoCal:
         rl = float(np.clip(rl, 0.0, 2.0))
         tau_evt = self._evt_tau()
         hat_pi = float(np.clip(self.tau_w + 0.05 * (rl - 0.5), 0.10, 0.98))
-        fill = len(self.tail_buf) / max(1.0, float(self.buffer_maxlen))
-        w_evt = self.mix_evt_weight * (1.0 - math.exp(-4.0 * fill))
+        buf_len = len(self.tail_buf)
+        fill = buf_len / max(1.0, float(self.buffer_maxlen))
+        evt_ready = buf_len >= 2 * self.evt.min_tail
+        w_evt = self.mix_evt_weight * (1.0 - math.exp(-2.5 * fill)) if evt_ready else 0.0
         w_pi = 1.0 - 0.5 * w_evt
         Z = max(1e-6, w_evt + w_pi)
         w_evt /= Z; w_pi /= Z
@@ -453,6 +485,11 @@ class Hyper:
     rag_entropy_tau: float = 1.0
     rag_entropy_thr: float = 1.2
     rag_top1_thr: float = 0.65
+    rag_auto_calibrate: bool = False
+    rag_calibration_samples: int = 100
+    rag_calibration_top1_pct: float = 0.1
+    rag_calibration_entropy_pct: float = 0.9
+    mmr_project_query_to_doc: bool = True
 
     ann_backend: str = "auto"
     ann_min_leaves: int = 64
@@ -662,10 +699,10 @@ class EmbedderProtocol(Protocol):
 
 # ---------- EmbeddingGemma embedder ----------
 class EmbeddingGemmaEmbedder(EmbedderProtocol):
-    """_pickands
-    google/embeddinggemma-300m 전용 임베더.
-    - 쿼리/문서 임베딩 분리 사용
-    - 캐시도 쿼리/문서 분리
+    """google/embeddinggemma-300m 전용 임베더.
+
+    - 쿼리/문서 인코더 분리 사용
+    - 캐시도 쿼리/문서 경로 별도 유지
     """
     def __init__(self, model_name: str = "google/embeddinggemma-300m",
                  *, device: Optional[str] = None, batch_size: int = 32,
@@ -956,6 +993,7 @@ class HTNRMemory:
         # ANN
         self._ann_index: Optional[HNSWIndex] = None
         self._ann_dirty = True
+        self._ann_deleted_accum = 0
 
         # Buffer / AutoCal / Chapter-PH
         self.buffer: Deque[BufferItem] = deque(maxlen=self.hyper.buffer_size)
@@ -977,6 +1015,11 @@ class HTNRMemory:
 
         # Torch / Device
         self._use_torch = bool(self.hyper.use_torch and _HAS_TORCH and not self.hyper.torch_force_cpu)
+
+        # RAG auto-calibration state
+        self._rag_cal_scores: List[float] = []
+        self._rag_cal_entropy: List[float] = []
+        self._rag_calibrated = not bool(self.hyper.rag_auto_calibrate)
         if self._use_torch:
             if _TORCH_CUDA:
                 self._device = torch.device("cuda")
@@ -987,11 +1030,7 @@ class HTNRMemory:
             self._device = None
 
         # OOC streaming cache state
-        self._ooc = {
-            "copy_stream": None, "comp_stream": None,
-            "buf0": None, "buf1": None, "out_host": None,
-            "chunk_rows": None, "buf_rows": 0,
-        }
+        self._ooc = self._init_ooc_cache()
 
         self._roots: set[int] = set()
         self.stats = defaultdict(int)
@@ -1003,6 +1042,40 @@ class HTNRMemory:
         self._sanity_check_hyper()
 
     # ----- Profile defaults -----
+    def _init_ooc_cache(self) -> Dict[str, Any]:
+        return {
+            "copy_stream": None,
+            "comp_stream": None,
+            "buf0": None,
+            "buf1": None,
+            "out_host": None,
+            "chunk_rows": None,
+            "buf_rows": 0,
+        }
+
+    def _reset_ooc_cache(self) -> None:
+        cache = getattr(self, "_ooc", None)
+        if isinstance(cache, dict):
+            for key in ("copy_stream", "comp_stream"):
+                stream = cache.get(key)
+                if stream is not None:
+                    try:
+                        stream.synchronize()
+                    except Exception:
+                        pass
+        self._ooc = self._init_ooc_cache()
+
+    def _release_pinned_leaf_resources(self, *, fallback: Optional[np.ndarray] = None) -> None:
+        if self._leaf_mat_host_t is not None:
+            try:
+                free_pinned_host_tensor(self._leaf_mat_host_t)
+            except Exception:
+                pass
+        self._leaf_mat_host_t = None
+        if fallback is not None:
+            self._leaf_mat = fallback
+        self._reset_ooc_cache()
+
     def _apply_profile_defaults(self) -> None:
         p = (self.hyper.profile or "QA").lower()
         if p == "qa":
@@ -1037,56 +1110,61 @@ class HTNRMemory:
         L, D = host_pinned_t.shape
         if L == 0:
             return np.zeros((0,), dtype=np.float32)
-        if self._ooc["chunk_rows"] is None:
-            try:
-                free_b, total_b = _torch.cuda.mem_get_info()
-                bytes_per_row = D * 4  # float32
-                max_rows = int((free_b * cover_ratio) // (bytes_per_row * 2 + 1))
-                self._ooc["chunk_rows"] = max(1024, min(max_rows, 65536))
-            except Exception:
-                self._ooc["chunk_rows"] = 32768
-        chunk_rows = int(self._ooc["chunk_rows"])
-        need_rows = min(chunk_rows, L)
-        buf_rows = int(self._ooc["buf_rows"])
-        if self._ooc["copy_stream"] is None:
-            self._ooc["copy_stream"] = _torch.cuda.Stream(device=self._device)
-            self._ooc["comp_stream"] = _torch.cuda.Stream(device=self._device)
-        if (self._ooc["buf0"] is None) or (need_rows > buf_rows):
-            self._ooc["buf0"] = _torch.empty((need_rows, D), dtype=_torch.float32, device=self._device)
-            self._ooc["buf1"] = _torch.empty((need_rows, D), dtype=_torch.float32, device=self._device)
-            self._ooc["out_host"] = _torch.empty(L, dtype=_torch.float32, pin_memory=True)
-            self._ooc["buf_rows"] = need_rows
-        copy_stream: torch.cuda.Stream = self._ooc["copy_stream"]
-        comp_stream: torch.cuda.Stream = self._ooc["comp_stream"]
-        buf0 = self._ooc["buf0"]; buf1 = self._ooc["buf1"]
-        out_host = self._ooc["out_host"]
-        out_np = out_host.numpy()
-        use_buf0 = True
-        offset = 0
-        with _torch.cuda.stream(copy_stream):
-            end = min(offset + chunk_rows, L)
-            if end > offset:
-                (buf0 if use_buf0 else buf1)[:end - offset].copy_(host_pinned_t[offset:end], non_blocking=True)
-        while offset < L:
-            with _torch.cuda.stream(comp_stream):
-                comp_stream.wait_stream(copy_stream)
-                cur_buf = buf0 if use_buf0 else buf1
-                cur_rows = min(chunk_rows, L - offset)
-                if cur_rows <= 0:
-                    break
-                result_gpu = _torch.matmul(cur_buf[:cur_rows], device_vec)
-                out_host[offset:offset + cur_rows].copy_(result_gpu, non_blocking=True)
-            next_offset = offset + cur_rows
-            if next_offset < L:
-                with _torch.cuda.stream(copy_stream):
-                    nxt_end = min(next_offset + chunk_rows, L)
-                    nxt_buf = buf1 if use_buf0 else buf0
-                    nxt_buf[:nxt_end - next_offset].copy_(host_pinned_t[next_offset:nxt_end], non_blocking=True)
-            use_buf0 = not use_buf0
-            offset = next_offset
-        copy_stream.synchronize()
-        comp_stream.synchronize()
-        return out_np.astype(np.float32)
+        try:
+            if self._ooc["chunk_rows"] is None:
+                try:
+                    free_b, _ = _torch.cuda.mem_get_info()
+                    bytes_per_row = D * 4  # float32
+                    max_rows = int((free_b * cover_ratio) // (bytes_per_row * 2 + 1))
+                    self._ooc["chunk_rows"] = int(np.clip(max_rows, 4096, 65536))
+                except Exception:
+                    self._ooc["chunk_rows"] = 32768
+            chunk_rows = int(self._ooc["chunk_rows"])
+            need_rows = min(chunk_rows, L)
+            buf_rows = int(self._ooc["buf_rows"])
+            if self._ooc["copy_stream"] is None:
+                self._ooc["copy_stream"] = _torch.cuda.Stream(device=self._device)
+                self._ooc["comp_stream"] = _torch.cuda.Stream(device=self._device)
+            if (self._ooc["buf0"] is None) or (need_rows > buf_rows):
+                self._ooc["buf0"] = _torch.empty((need_rows, D), dtype=_torch.float32, device=self._device)
+                self._ooc["buf1"] = _torch.empty((need_rows, D), dtype=_torch.float32, device=self._device)
+                self._ooc["out_host"] = _torch.empty(L, dtype=_torch.float32, pin_memory=True)
+                self._ooc["buf_rows"] = need_rows
+            copy_stream: torch.cuda.Stream = self._ooc["copy_stream"]
+            comp_stream: torch.cuda.Stream = self._ooc["comp_stream"]
+            buf0 = self._ooc["buf0"]; buf1 = self._ooc["buf1"]
+            out_host = self._ooc["out_host"]
+            out_np = out_host.numpy()
+            use_buf0 = True
+            offset = 0
+            with _torch.cuda.stream(copy_stream):
+                end = min(offset + chunk_rows, L)
+                if end > offset:
+                    (buf0 if use_buf0 else buf1)[:end - offset].copy_(host_pinned_t[offset:end], non_blocking=True)
+            while offset < L:
+                with _torch.cuda.stream(comp_stream):
+                    comp_stream.wait_stream(copy_stream)
+                    cur_buf = buf0 if use_buf0 else buf1
+                    cur_rows = min(chunk_rows, L - offset)
+                    if cur_rows <= 0:
+                        break
+                    result_gpu = _torch.matmul(cur_buf[:cur_rows], device_vec)
+                    out_host[offset:offset + cur_rows].copy_(result_gpu, non_blocking=True)
+                next_offset = offset + cur_rows
+                if next_offset < L:
+                    with _torch.cuda.stream(copy_stream):
+                        nxt_end = min(next_offset + chunk_rows, L)
+                        nxt_buf = buf1 if use_buf0 else buf0
+                        nxt_buf[:nxt_end - next_offset].copy_(host_pinned_t[next_offset:nxt_end], non_blocking=True)
+                use_buf0 = not use_buf0
+                offset = next_offset
+            copy_stream.synchronize()
+            comp_stream.synchronize()
+            return out_np.astype(np.float32)
+        except Exception as e:
+            logger.warning(f"OOC streaming failed, resetting OOC state: {e}")
+            self._reset_ooc_cache()
+            raise
 
     # ---------- Cache & ANN ----------
     def _build_soa(self) -> None:
@@ -1126,6 +1204,7 @@ class HTNRMemory:
             except Exception:
                 pass
             self._leaf_mat_host_t = None
+            self._reset_ooc_cache()
 
         self._leaf_mat = None
         self._leaf_ids = None
@@ -1157,6 +1236,7 @@ class HTNRMemory:
                         pass
                     self._leaf_mat_host_t = None
                     pinned = None
+                    self._reset_ooc_cache()
 
             if not reused:
                 t = allocate_pinned_host_tensor(normalized.shape)
@@ -1174,13 +1254,16 @@ class HTNRMemory:
                         except Exception:
                             pass
                         self._leaf_mat_host_t = None
+                        self._reset_ooc_cache()
 
             if not reused:
                 self._leaf_mat = normalized
                 self._leaf_mat_host_t = None
+                self._reset_ooc_cache()
         else:
             self._leaf_mat = normalized
             self._leaf_mat_host_t = None
+            self._reset_ooc_cache()
 
         self._leaf_ids = list(self.leaves)
         self._build_soa()
@@ -1210,12 +1293,22 @@ class HTNRMemory:
         self._soa["V"] = np.minimum(2.0, scaled + E).astype(np.float32)
 
     def _ensure_ann_index(self) -> None:
-        if self.hyper.ann_backend == "none": self._ann_index = None; return
-        if self.hyper.ann_backend == "exact": self._ann_index = None; return
+        if self.hyper.ann_backend == "none":
+            self._ann_index = None
+            self._ann_deleted_accum = 0
+            return
+        if self.hyper.ann_backend == "exact":
+            self._ann_index = None
+            self._ann_deleted_accum = 0
+            return
         if self.hyper.ann_backend in ("auto", "hnsw") and not _HAS_HNSW:
-            self._ann_index = None; return
+            self._ann_index = None
+            self._ann_deleted_accum = 0
+            return
         if len(self.leaves) < self.hyper.ann_min_leaves:
-            self._ann_index = None; return
+            self._ann_index = None
+            self._ann_deleted_accum = 0
+            return
         if self._leaf_mat is None or self._leaf_ids is None:
             return
         needed_capacity = int(len(self.leaves) * self.hyper.ann_capacity_slack + self.hyper.ann_capacity_extra)
@@ -1229,10 +1322,13 @@ class HTNRMemory:
                 self._ann_index.add_items(self._leaf_mat, labels)
                 self._ann_index.set_ef(self.hyper.ann_efS)
                 self._ann_dirty = False
+                self._ann_deleted_accum = 0
                 self.log.write({"t": "ann_build", "L": len(self.leaves)})
             except Exception as e:
                 logger.warning(f"HNSW build failed: {e}")
-                self._ann_index = None; self._ann_dirty = True
+                self._ann_index = None
+                self._ann_dirty = True
+                self._ann_deleted_accum = 0
         else:
             try: self._ann_index.resize_if_needed(needed_capacity)
             except Exception: pass
@@ -1247,15 +1343,28 @@ class HTNRMemory:
             if self._ann_index is None:
                 self._ann_dirty = True; return
             try:
+                marked = 0
                 for nid in removed:
-                    try: self._ann_index.mark_deleted(int(nid))
+                    try:
+                        self._ann_index.mark_deleted(int(nid))
+                        marked += 1
                     except Exception:
-                        self._ann_dirty = True; return
-                if added:
-                    labels = np.array(added, dtype=np.int64)
-                    embs = np.stack([self.nodes[n].emb for n in added], axis=0)
+                        self._ann_dirty = True
+                        self._ann_deleted_accum += marked
+                        return
+                alive_added = [n for n in added if n in self.nodes]
+                if alive_added:
+                    labels = np.array(alive_added, dtype=np.int64)
+                    embs = np.stack([self.nodes[n].emb for n in alive_added], axis=0)
                     embs = _normalize(embs, self.num.eps_norm)
                     self._ann_index.add_items(embs, labels)
+                self._ann_deleted_accum += marked
+                rebuild_threshold = max(16, int(0.2 * max(1, len(self.leaves) + self._ann_deleted_accum)))
+                if self._ann_deleted_accum >= rebuild_threshold:
+                    self._ann_index = None
+                    self._ann_dirty = True
+                    self._ann_deleted_accum = 0
+                    return
                 self._ann_dirty = False
             except Exception:
                 self._ann_dirty = True
@@ -1946,6 +2055,28 @@ class HTNRMemory:
             self._ensure_ann_index()
 
     # ---------- Retrieval (+ RAG) ----------
+    def _rag_update_calibration(self, top1: float, ent: float) -> None:
+        if not self.hyper.rag_auto_calibrate or self._rag_calibrated:
+            return
+        self._rag_cal_scores.append(float(top1))
+        self._rag_cal_entropy.append(float(ent))
+        target = max(10, int(self.hyper.rag_calibration_samples))
+        if len(self._rag_cal_scores) < target:
+            return
+        scores = np.array(self._rag_cal_scores, dtype=np.float32)
+        ents = np.array(self._rag_cal_entropy, dtype=np.float32)
+        frac = float(np.clip(self.hyper.rag_calibration_top1_pct, 0.01, 0.5))
+        k = max(1, int(frac * scores.size))
+        low_conf = np.sort(scores)[:k]
+        new_top1_thr = float(np.mean(low_conf)) if low_conf.size else self.hyper.rag_top1_thr
+        ent_q = float(np.clip(self.hyper.rag_calibration_entropy_pct, 0.5, 0.999))
+        new_entropy_thr = float(np.quantile(ents, ent_q)) if ents.size else self.hyper.rag_entropy_thr
+        self.hyper.rag_top1_thr = new_top1_thr
+        self.hyper.rag_entropy_thr = new_entropy_thr
+        self._rag_calibrated = True
+        self._rag_cal_scores.clear()
+        self._rag_cal_entropy.clear()
+
     def _uncertainty(self, scores: np.ndarray, k: int) -> Tuple[float, float]:
         if scores.size == 0:
             return float("inf"), 0.0
@@ -1982,16 +2113,31 @@ class HTNRMemory:
 
         # Query blend
         comp = q
+        blend_w: Optional[float] = None
         mode = (self.hyper.query_blend or "none").lower()
         if mode != "none":
             cos_qm = _fast_dot(q, M_agg)
             if mode == "fixed":
-                w = float(np.clip(self.hyper.query_blend_fixed, 0.0, 0.95))
+                blend_w = float(np.clip(self.hyper.query_blend_fixed, 0.0, 0.95))
             else:
                 lo, hi = self.hyper.query_blend_cos_low, self.hyper.query_blend_cos_high
                 t = (cos_qm - lo) / max(1e-6, (hi - lo))
-                w = float(np.clip(t, 0.0, 1.0)) * float(np.clip(self.hyper.query_blend_fixed, 0.0, 0.95))
-            comp = _normalize((1.0 - w) * q + w * M_agg, self.num.eps_norm)
+                blend_w = float(np.clip(t, 0.0, 1.0)) * float(np.clip(self.hyper.query_blend_fixed, 0.0, 0.95))
+            comp = _normalize((1.0 - blend_w) * q + blend_w * M_agg, self.num.eps_norm)
+
+        comp_doc = comp
+        if getattr(self.hyper, "mmr_project_query_to_doc", False):
+            try:
+                if hasattr(self.model, "encode_document"):
+                    q_doc = self.model.encode_document([query])[0]
+                else:
+                    q_doc = self.model.encode([query])[0]
+                q_doc = _normalize(q_doc, self.num.eps_norm)
+                comp_doc = q_doc
+                if blend_w is not None:
+                    comp_doc = _normalize((1.0 - blend_w) * q_doc + blend_w * M_agg, self.num.eps_norm)
+            except Exception:
+                comp_doc = comp
 
         # score computation
         if self._use_torch and self._device and self._device.type == "cuda":
@@ -2003,6 +2149,7 @@ class HTNRMemory:
                 except Exception as e:
                     logger.warning(f"OOC streaming failed, fallback to CPU: {e}")
                     self.stats['ooc_fallback'] += 1
+                    self._release_pinned_leaf_resources(fallback=leaf_mat)
                     scores = (leaf_mat @ comp).astype(np.float32)
             else:
                 scores = (leaf_mat @ comp).astype(np.float32)
@@ -2031,7 +2178,7 @@ class HTNRMemory:
                     if node.sent_embs is not None and node.sent_embs.shape[0] == len(sents):
                         precomputed = node.sent_embs
                     selected = mmr_select(
-                        comp, sents, precomputed_embs=precomputed,
+                        comp_doc, sents, precomputed_embs=precomputed,
                         encode_fn=self._encode_cached_sentences,
                         topk=topk_sents, lambda_mmr=0.75, max_sentences=48,
                     )
@@ -2066,7 +2213,10 @@ class HTNRMemory:
 
         if use_rag and self.external_rag:
             ent, top1 = self._uncertainty(scores, k=self.hyper.rag_topk)
-            if (top1 < self.hyper.rag_top1_thr) or (ent > self.hyper.rag_entropy_thr):
+            self._rag_update_calibration(top1, ent)
+            top1_thr = float(self.hyper.rag_top1_thr)
+            ent_thr = float(self.hyper.rag_entropy_thr)
+            if (top1 < top1_thr) or (ent > ent_thr):
                 rag = self._do_rag(query, K_cap, return_meta=True)
                 seen = set()
                 final = []
