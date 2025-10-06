@@ -1,28 +1,4 @@
-# htnr_memory_v57_dendritic_prune.py
-# -*- coding: utf-8 -*-
-"""
-HTNR Memory — V57 (Dendritic + Prune + Offline Consolidation)
-- 기반: V56-ANN+ (EmbeddingGemma edition, patched)
-- 추가: 수상돌기(다중 구획) 노드, 가지치기 데몬, 오프라인 공고화 루프
-- GPU OOC(matvec) + 핀드(host) DMA + HNSW ANN 경로 유지/강화
-- EVT: PWM(L-moment) 기본 + Pickands 보조 + Weibull(ξ≤0) 강제 + 끝점(x_F≤1) 구조적 보장
-- Page–Hinkley: 지수망각 + var_warmup + min_std
-- 홈오스타시스: μ + σ·sigmoid(z) 재정의 (E는 감쇠 보호에만 사용)
-- MMR: 문자 3-그램 자카드로 중복억제(한국어 친화)
-- 정확 경로 폴백: 메모리 예산(MB) 기반 sub@sub.T 상한
-- 스냅샷: float16 압축 저장 옵션(로드 시 float32 복구)
-- 캐시 키: 임베더 식별자 포함(cache_tag)
 
-사용 예시:
-    mem = HTNRMemory(
-        EmbeddingGemmaEmbedder("google/embeddinggemma-300m", device=None, batch_size=64, normalize_embeddings=True),
-        hyper=Hyper(use_torch=True, ann_backend="auto"),
-        xopts=XOpts(proactive_compress_enable=False, lsh_density_enable=False),
-    )
-    mem.process_and_add("hello world")
-    mem.flush_buffer()
-    print(mem.retrieve_for_query("greeting", K_cap=5))
-"""
 
 from __future__ import annotations
 
@@ -84,7 +60,7 @@ def _normalize(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     if arr.ndim == 1:
         n = float(np.linalg.norm(arr))
         if n <= eps:
-            return arr
+            return np.zeros_like(arr)
         return arr / n
     n = np.linalg.norm(arr, axis=1, keepdims=True)
     out = np.divide(arr, (n + eps), out=np.zeros_like(arr), where=(n > eps))
@@ -2368,7 +2344,8 @@ class HTNRMemory:
             work = ids[:cap]
             X = _normalize(np.stack([self.nodes[i].emb for i in work], axis=0), 1e-8)
             m = X.shape[0]
-            k = max(1, min(int(self.hyper.offline_k_per_chapter), m//4))
+            k = max(1, min(int(self.hyper.offline_k_per_chapter), m // 4))
+            k = min(k, m)
             # 간단 k-medoids (파워 이니셜라이즈 + 3회 업데이트)
             medoid_idx = [int(np.argmax(np.random.random(m)))]
             for _ in range(1, k):
@@ -2377,21 +2354,41 @@ class HTNRMemory:
                 else:
                     sim_max = np.max(X @ X[np.asarray(medoid_idx)].T, axis=1)
                 d2 = np.maximum(0.0, 1.0 - sim_max)
-                tot = float(np.sum(d2))
+
+                probs = d2.astype(np.float64)
+                probs[np.asarray(medoid_idx)] = 0.0
+                tot = float(np.sum(probs))
+
                 if not np.isfinite(tot) or tot <= 0.0:
-                    probs = np.full(m, 1.0 / max(1, m), dtype=np.float64)
+                    avail = np.setdiff1d(np.arange(m), np.asarray(medoid_idx), assume_unique=False)
+                    if avail.size == 0:
+                        break
+                    j = int(avail[np.argmax(d2[avail])])
                 else:
-                    probs = d2 / tot
-                    psum = float(np.sum(probs))
-                    if not np.isfinite(psum) or psum <= 0.0:
-                        probs = np.full(m, 1.0 / max(1, m), dtype=np.float64)
-                    else:
-                        probs = probs / psum
-                medoid_idx.append(int(np.random.choice(m, p=probs)))
-            medoid_idx = list(dict.fromkeys(medoid_idx))  # unique
+                    probs /= tot
+                    j = int(np.random.choice(m, p=probs))
+
+                medoid_idx.append(j)
+
+            medoid_idx = list(dict.fromkeys(medoid_idx))
+            if len(medoid_idx) < k:
+                chosen = np.asarray(medoid_idx, dtype=np.int64)
+                if chosen.size == 0:
+                    pool = np.arange(m)
+                    need = k
+                else:
+                    sim_max = np.max(X @ X[chosen].T, axis=1)
+                    d2_all = np.maximum(0.0, 1.0 - sim_max)
+                    pool = np.setdiff1d(np.arange(m), chosen, assume_unique=False)
+                    order = np.argsort(-d2_all[pool])
+                    pool = pool[order]
+                    need = k - len(medoid_idx)
+                medoid_idx += [int(x) for x in pool[:need]]
+
             if len(medoid_idx) < k:
                 pool = [i for i in range(m) if i not in medoid_idx]
-                medoid_idx += pool[:k-len(medoid_idx)]
+                medoid_idx += pool[:k - len(medoid_idx)]
+            medoid_idx = medoid_idx[:k]
             # 3회 할당-갱신
             for _ in range(3):
                 # 할당
@@ -2573,9 +2570,10 @@ class HTNRMemory:
                         text = " ".join(selected)
                 except Exception:
                     pass
-            # 사용 통계
-            node.hits += 1
-            node.last_access_step = self.step
+            # 사용 통계 (멀티스레드 대비 안전)
+            with self._lock:
+                node.hits += 1
+                node.last_access_step = self.step
 
             raw_source = node.source if isinstance(node.source, str) else ""
             doc_id: Optional[str] = None
